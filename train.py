@@ -15,13 +15,46 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
+import platform
+
+# 수정: 한글 표시 — 폰트 이름이 ttflist와 안 맞으면 DejaVu Sans로 남아 경고 발생하므로, 경로로 폰트 지정
+def _get_korean_font_prop():
+    """한글 지원 폰트 파일 경로를 찾아 FontProperties 반환. 없으면 None."""
+    if platform.system() == "Darwin":
+        # macOS 기본 한글 폰트 경로 (버전별로 다를 수 있음, .ttc 컬렉션 포함)
+        paths = [
+            Path("/System/Library/Fonts/Supplemental/AppleGothic.ttf"),
+            Path("/System/Library/Fonts/AppleGothic.ttf"),
+            Path("/System/Library/Fonts/AppleGothic.ttc"),
+            Path("/Library/Fonts/AppleGothic.ttf"),
+            Path("/System/Library/Fonts/Apple SD Gothic Neo.ttf"),
+            Path("/System/Library/Fonts/Apple SD Gothic Neo.ttc"),
+            Path.home() / "Library/Fonts/NanumGothic.ttf",
+        ]
+    elif platform.system() == "Windows":
+        paths = [
+            Path("C:/Windows/Fonts/malgun.ttf"),
+            Path("C:/Windows/Fonts/NanumGothic.ttf"),
+        ]
+    else:
+        paths = [Path("/usr/share/fonts/truetype/nanum/NanumGothic.ttf")]
+    for p in paths:
+        if p.exists():
+            return matplotlib.font_manager.FontProperties(fname=str(p))
+    return None
+
+from sklearn.metrics import mean_squared_error, r2_score
 
 from src.data_loader import DataLoader
 from src.env import DevStressEnv
 from src.reward_model import StressRewardModel
 from src.a2c import A2CAgent
+
+# 수정: Action Distribution 시각화용 레이블
+ACTION_LABELS = ["집중근무", "휴식", "커피", "디버깅"]
 
 
 # 기본 하이퍼파라미터
@@ -72,6 +105,12 @@ def main():
     reward_model = StressRewardModel(alpha=1.0, stress_scale=-1.0, reward_scale=0.1)
     reward_model.fit(X, y)
     print("[RewardModel] Stress_Level 회귀 모델 학습 완료")
+    # 수정: 학습 데이터 기준 보상 모델 성능 출력 (R², RMSE)
+    X_scaled = reward_model.scaler_x.transform(X)
+    y_pred = reward_model.model.predict(X_scaled)
+    r2 = r2_score(y, y_pred)
+    rmse = np.sqrt(mean_squared_error(y, y_pred))
+    print(f"[RewardModel] 학습 데이터 기준 R²={r2:.4f}, RMSE={rmse:.4f}")
 
     # ---------- 3. 환경 및 에이전트 ----------
     env = DevStressEnv(
@@ -88,17 +127,23 @@ def main():
         entropy_coef=0.05,  # 탐색 강화: 휴식/디버깅 등 스트레스 감소 행동 발견 유도
     )
 
-    # ---------- 4. 학습 루프 (A2C 롤아웃 후 업데이트) ----------
+    # ---------- 4. 학습 루프 (n-step A2C: 매 n_steps마다 중간 업데이트) ----------
     episode_rewards: list = []
     episode_stresses: list = []
+    # 수정: 에피소드별 액션 선택 횟수 기록 → 마지막 100 에피소드 분포 시각화용
+    episode_action_counts: list = []
     global_step = 0
 
     for episode in range(args.n_episodes):
-        obs, _ = env.reset(seed=args.seed + episode)
+        # 수정: 초반 절반은 시드 고정(과적합 완화), 후반은 seed=None으로 랜덤 리셋
+        reset_seed = (args.seed + episode) if episode < args.n_episodes // 2 else None
+        obs, _ = env.reset(seed=reset_seed)
         episode_reward = 0.0
         episode_stress_list: list = []
+        # 수정: 에피소드 내 선택한 액션 기록 (분포 집계용)
+        episode_actions: list = []
 
-        # 롤아웃 버퍼
+        # 롤아웃 버퍼 (n_steps마다 한 번씩 업데이트에 사용)
         states_buf: list = []
         actions_buf: list = []
         rewards_buf: list = []
@@ -107,6 +152,7 @@ def main():
         for step in range(args.max_steps):
             action, log_prob, entropy, value = agent.select_action(obs, deterministic=False)
             agent.store_step_values(value)
+            episode_actions.append(action)
 
             states_buf.append(obs)
             actions_buf.append(action)
@@ -122,25 +168,49 @@ def main():
             obs = next_obs
             global_step += 1
 
+            # 수정: n-step A2C — 버퍼가 정확히 n_steps일 때만 업데이트 (값 버퍼와 길이 일치 유지)
+            if len(states_buf) == args.n_steps:
+                agent.finish_rollout()
+                n_use = args.n_steps
+                states_arr = np.array(states_buf[:n_use])
+                actions_arr = np.array(actions_buf[:n_use])
+                rewards_arr = np.array(rewards_buf[:n_use])
+                dones_arr = np.array(dones_buf[:n_use])
+                agent.update(
+                    states=states_arr,
+                    actions=actions_arr,
+                    rewards=rewards_arr,
+                    dones=dones_arr,
+                    next_states=obs,
+                    next_done=done,
+                )
+                states_buf = states_buf[n_use:]
+                actions_buf = actions_buf[n_use:]
+                rewards_buf = rewards_buf[n_use:]
+                dones_buf = dones_buf[n_use:]
+
             if done:
                 break
 
-        # 롤아웃 수집 완료 → 다음 상태는 마지막 next_obs
-        agent.finish_rollout()
-        next_done = True  # 에피소드 끝났으므로
-        states_arr = np.array(states_buf)
-        actions_arr = np.array(actions_buf)
-        rewards_arr = np.array(rewards_buf)
-        dones_arr = np.array(dones_buf)
+        # 수정: 에피소드 종료 시 남은 스텝이 있으면 한 번 더 업데이트
+        if len(states_buf) > 0:
+            agent.finish_rollout()
+            states_arr = np.array(states_buf)
+            actions_arr = np.array(actions_buf)
+            rewards_arr = np.array(rewards_buf)
+            dones_arr = np.array(dones_buf)
+            agent.update(
+                states=states_arr,
+                actions=actions_arr,
+                rewards=rewards_arr,
+                dones=dones_arr,
+                next_states=obs,
+                next_done=True,
+            )
 
-        agent.update(
-            states=states_arr,
-            actions=actions_arr,
-            rewards=rewards_arr,
-            dones=dones_arr,
-            next_states=next_obs,
-            next_done=next_done,
-        )
+        # 수정: 에피소드별 액션 카운트 저장 (0~3 인덱스별 횟수)
+        counts = np.bincount(episode_actions, minlength=action_dim)
+        episode_action_counts.append(counts)
 
         mean_stress = np.mean(episode_stress_list) if episode_stress_list else 0.0
         episode_rewards.append(episode_reward)
@@ -194,6 +264,30 @@ def main():
         plt.savefig(save_dir / "training_curves_smooth.png", dpi=150)
         plt.close()
         print(f"[시각화] 저장됨: {save_dir / 'training_curves_smooth.png'}")
+
+    # 수정: 마지막 100 에피소드 기준 Action Distribution 막대 그래프 저장 (한글 폰트 경로로 적용해 DejaVu Sans 경고 제거)
+    korean_font = _get_korean_font_prop()
+    last_n = min(100, len(episode_action_counts))
+    if last_n > 0:
+        last_counts = np.array(episode_action_counts[-last_n:])
+        action_totals = last_counts.sum(axis=0)
+        fig_dist, ax_dist = plt.subplots(1, 1, figsize=(8, 4))
+        ax_dist.bar(ACTION_LABELS, action_totals, color=["#2ecc71", "#3498db", "#e67e22", "#9b59b6"], edgecolor="black", alpha=0.8)
+        ax_dist.set_xticks(range(len(ACTION_LABELS)))
+        if korean_font is not None:
+            ax_dist.set_ylabel("선택 횟수", fontproperties=korean_font)
+            ax_dist.set_title(f"Action Distribution (마지막 {last_n} 에피소드)", fontproperties=korean_font)
+            ax_dist.set_xticklabels(ACTION_LABELS, fontproperties=korean_font)
+        else:
+            ax_dist.set_ylabel("선택 횟수")
+            ax_dist.set_title(f"Action Distribution (마지막 {last_n} 에피소드)")
+            ax_dist.set_xticklabels(ACTION_LABELS)
+        matplotlib.rcParams["axes.unicode_minus"] = False
+        plt.tight_layout()
+        action_dist_path = save_dir / "action_dist.png"
+        plt.savefig(action_dist_path, dpi=150)
+        plt.close()
+        print(f"[시각화] 저장됨: {action_dist_path}")
 
     print("학습 완료.")
 
